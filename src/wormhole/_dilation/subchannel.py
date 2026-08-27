@@ -1,18 +1,18 @@
-import six
-from collections import deque
+from collections import deque, defaultdict
 from attr import attrs, attrib
-from attr.validators import instance_of, provides
+from attr.validators import instance_of
 from zope.interface import implementer
-from twisted.internet.defer import inlineCallbacks, returnValue
+from twisted.internet.defer import inlineCallbacks
 from twisted.internet.interfaces import (ITransport, IProducer, IConsumer,
                                          IAddress, IListeningPort,
                                          IHalfCloseableProtocol,
                                          IStreamClientEndpoint,
-                                         IStreamServerEndpoint)
+                                         IStreamServerEndpoint,
+                                         )
 from twisted.internet.error import ConnectionDone
 from automat import MethodicalMachine
 from .._interfaces import ISubChannel, IDilationManager
-from ..observer import OneShotObserver
+from ..util import provides
 
 # each subchannel frame (the data passed into transport.write(data)) gets a
 # 9-byte header prefix (type, subchannel id, and sequence number), then gets
@@ -20,23 +20,8 @@ from ..observer import OneShotObserver
 # with a 4-byte length prefix (which only covers the padded message, not the
 # length prefix itself), so the padded message must be less than 2**32 bytes
 # long.
-MAX_FRAME_LENGTH = 2**32 - 1 - 9 - 16;
+MAX_FRAME_LENGTH = 2**32 - 1 - 9 - 16
 
-@attrs
-class Once(object):
-    _errtype = attrib()
-
-    def __attrs_post_init__(self):
-        self._called = False
-
-    def __call__(self):
-        if self._called:
-            raise self._errtype()
-        self._called = True
-
-
-class SingleUseEndpointError(Exception):
-    pass
 
 # created in the (OPEN) state, by either:
 #  * receipt of an OPEN message
@@ -56,21 +41,38 @@ class SingleUseEndpointError(Exception):
 class AlreadyClosedError(Exception):
     pass
 
+
 class NormalCloseUsedOnHalfCloseable(Exception):
     pass
+
+
 class HalfCloseUsedOnNonHalfCloseable(Exception):
     pass
 
 
+class UnexpectedSubprotocol(Exception):
+    """
+    The peer sends an OPEN for a subprotocol name application code
+    indicates will never exist
+    """
+
+
 @implementer(IAddress)
-class _WormholeAddress(object):
+class _WormholeAddress:
     pass
 
 
 @implementer(IAddress)
 @attrs
-class _SubchannelAddress(object):
-    _scid = attrib(validator=instance_of(six.integer_types))
+class SubchannelAddress:
+    """
+    All subchannels have a named sub-protocol (as sent by our peer in
+    the OPEN call).
+
+    Although each subchannel does have an 'id', this is a concept
+    private to this implementation, and not exposed here on purpose.
+    """
+    subprotocol = attrib(validator=instance_of(str))
 
 
 @attrs(eq=False)
@@ -78,11 +80,11 @@ class _SubchannelAddress(object):
 @implementer(IProducer)
 @implementer(IConsumer)
 @implementer(ISubChannel)
-class SubChannel(object):
-    _scid = attrib(validator=instance_of(six.integer_types))
+class SubChannel:
+    _scid = attrib(validator=instance_of(int))
     _manager = attrib(validator=provides(IDilationManager))
     _host_addr = attrib(validator=instance_of(_WormholeAddress))
-    _peer_addr = attrib(validator=instance_of(_SubchannelAddress))
+    _peer_addr = attrib(validator=instance_of(SubchannelAddress))
 
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self,
@@ -240,7 +242,10 @@ class SubChannel(object):
     # we won't ever see an OPEN, since L4 will log+ignore those for us
     closing.upon(local_data, enter=closing, outputs=[error_closed_write])
     closing.upon(local_close, enter=closing, outputs=[error_closed_close])
-    # the CLOSED state won't ever see messages, since we'll be deleted
+    # the CLOSED state shouldn't ever see messages, since we'll be deleted
+    # (but a local user should be able to call "close" without having
+    # to know what state we're in)
+    closed.upon(local_close, enter=closed, outputs=[])
 
     # our endpoints use these
 
@@ -251,7 +256,7 @@ class SubChannel(object):
             self.connect_protocol_half()
         else:
             # move from UNCONNECTED to OPEN
-            self.connect_protocol_full();
+            self.connect_protocol_full()
 
     def _deliver_queued_data(self):
         for data in self._pending_remote_data:
@@ -263,7 +268,7 @@ class SubChannel(object):
 
     # ITransport
     def write(self, data):
-        assert isinstance(data, type(b""))
+        assert isinstance(data, bytes)
         assert len(data) <= MAX_FRAME_LENGTH
         self.local_data(data)
 
@@ -274,7 +279,7 @@ class SubChannel(object):
         if not IHalfCloseableProtocol.providedBy(self._protocol):
             # this is a clear error
             raise HalfCloseUsedOnNonHalfCloseable()
-        self.local_close();
+        self.local_close()
 
     def loseConnection(self):
         # TODO: what happens if an IHalfCloseableProtocol calls normal
@@ -312,59 +317,26 @@ class SubChannel(object):
 
 @implementer(IStreamClientEndpoint)
 @attrs
-class ControlEndpoint(object):
-    _peer_addr = attrib(validator=provides(IAddress))
-    _subchannel_zero = attrib(validator=provides(ISubChannel))
-    _eventual_queue = attrib(repr=False)
-    _used = False
-
-    def __attrs_post_init__(self):
-        self._once = Once(SingleUseEndpointError)
-        self._wait_for_main_channel = OneShotObserver(self._eventual_queue)
-
-    # from manager
-
-    def _main_channel_ready(self):
-        self._wait_for_main_channel.fire(None)
-    def _main_channel_failed(self, f):
-        self._wait_for_main_channel.error(f)
-
-    @inlineCallbacks
-    def connect(self, protocolFactory):
-        # return Deferred that fires with IProtocol or Failure(ConnectError)
-        self._once()
-        yield self._wait_for_main_channel.when_fired()
-        p = protocolFactory.buildProtocol(self._peer_addr)
-        self._subchannel_zero._set_protocol(p)
-        # this sets p.transport and calls p.connectionMade()
-        p.makeConnection(self._subchannel_zero)
-        self._subchannel_zero._deliver_queued_data()
-        returnValue(p)
-
-
-@implementer(IStreamClientEndpoint)
-@attrs
-class SubchannelConnectorEndpoint(object):
+class SubchannelConnectorEndpoint:
+    _subprotocol = attrib(validator=instance_of(str))
     _manager = attrib(validator=provides(IDilationManager))
     _host_addr = attrib(validator=instance_of(_WormholeAddress))
     _eventual_queue = attrib(repr=False)
 
     def __attrs_post_init__(self):
         self._connection_deferreds = deque()
-        self._wait_for_main_channel = OneShotObserver(self._eventual_queue)
-
-    def _main_channel_ready(self):
-        self._wait_for_main_channel.fire(None)
-    def _main_channel_failed(self, f):
-        self._wait_for_main_channel.error(f)
+        if not self._subprotocol:
+            raise ValueError(
+                "subprotocol must be a non-empty str"
+            )
 
     @inlineCallbacks
     def connect(self, protocolFactory):
         # return Deferred that fires with IProtocol or Failure(ConnectError)
-        yield self._wait_for_main_channel.when_fired()
+        yield self._manager._main_channel.when_fired()
         scid = self._manager.allocate_subchannel_id()
-        self._manager.send_open(scid)
-        peer_addr = _SubchannelAddress(scid)
+        self._manager.send_open(scid, self._subprotocol)
+        peer_addr = SubchannelAddress(self._subprotocol)
         # ? f.doStart()
         # ? f.startedConnecting(CONNECTOR) # ??
         sc = SubChannel(scid, self._manager, self._host_addr, peer_addr)
@@ -372,57 +344,93 @@ class SubchannelConnectorEndpoint(object):
         p = protocolFactory.buildProtocol(peer_addr)
         sc._set_protocol(p)
         p.makeConnection(sc)  # set p.transport = sc and call connectionMade()
-        returnValue(p)
+        return p
+
+
+class IllegalSubprotocolError(Exception):
+    """
+    A peer tried to open a subprotocol that has no listener.
+    """
 
 
 @implementer(IStreamServerEndpoint)
 @attrs
-class SubchannelListenerEndpoint(object):
-    _manager = attrib(validator=provides(IDilationManager))
-    _host_addr = attrib(validator=provides(IAddress))
-    _eventual_queue = attrib(repr=False)
+class SubchannelListenerEndpoint:
+    """
+    This endpoint is used by application code to attach a factory to a
+    given subprotocol. Instances are gotten via DilatedWormhole.listener_for()
 
-    def __attrs_post_init__(self):
-        self._once = Once(SingleUseEndpointError)
-        self._factory = None
-        self._pending_opens = deque()
-        self._wait_for_main_channel = OneShotObserver(self._eventual_queue)
+    On listen(), we register for incoming OPENs on for this
+    subprotocol name.
+    """
+
+    subprotocol_name = attrib()
+    _manager = attrib()
+
+    # this can, in fact, be async
+    @inlineCallbacks
+    def listen(self, factory):
+        yield self._manager._main_channel.when_fired()
+        self._manager._register_subprotocol_factory(self.subprotocol_name, factory)
+        return SubchannelListeningPort(self._manager._host_addr)
+
+
+class SubchannelDemultiplex:
+    """
+    Helper for Inbound to await factories for particular subprotocols,
+    and deliver pending and future OPEN messages to them.
+
+    If expected_subprotocols is `None` (the default) then all incoming
+    OPENs are held pending a future listen. Otherwise,
+    `expected_subprotocols` is a collection of str, where any OPEN not
+    in the list produces an error.
+    """
+    def __init__(self, expected_subprotocols=None):
+        self._factories = dict()  # name -> IProtocolFactory
+        self._pending_opens = defaultdict(deque)  # name -> deque[tuple[transport, address]]
+        self._expected = expected_subprotocols
 
     # from manager (actually Inbound)
+    # t is Subchannel (transport) instance
+    # peer_addr is a SubchannelAddress
     def _got_open(self, t, peer_addr):
-        if self._factory:
-            self._connect(t, peer_addr)
+        # t is "ITransport"
+        name = peer_addr.subprotocol
+        if name in self._factories:
+            self._connect(self._factories[name], t, peer_addr)
         else:
-            self._pending_opens.append((t, peer_addr))
+            if self._expected is not None and name not in self._expected:
+                raise UnexpectedSubprotocol()
+            self._pending_opens[name].append((t, peer_addr))
 
-    def _connect(self, t, peer_addr):
-        p = self._factory.buildProtocol(peer_addr)
+    def _connect(self, factory, t, peer_addr):
+        p = factory.buildProtocol(peer_addr)
         t._set_protocol(p)
         p.makeConnection(t)
         t._deliver_queued_data()
 
-    def _main_channel_ready(self):
-        self._wait_for_main_channel.fire(None)
-    def _main_channel_failed(self, f):
-        self._wait_for_main_channel.error(f)
+    def register(self, subprotocol_name, factory):
+        if subprotocol_name in self._factories:
+            raise ValueError(
+                f'Already listening for subprotocol "{subprotocol_name}"'
+            )
+        self._factories[subprotocol_name] = factory
 
-    # IStreamServerEndpoint
+        # deliver any pending OPENs that have accumulated for this
+        # subprotocol
+        try:
+            pending = self._pending_opens.pop(subprotocol_name)
+        except KeyError:
+            pending = deque()
 
-    @inlineCallbacks
-    def listen(self, protocolFactory):
-        self._once()
-        yield self._wait_for_main_channel.when_fired()
-        self._factory = protocolFactory
-        while self._pending_opens:
-            (t, peer_addr) = self._pending_opens.popleft()
-            self._connect(t, peer_addr)
-        lp = SubchannelListeningPort(self._host_addr)
-        returnValue(lp)
+        while pending:
+            (t, peer_addr) = pending.popleft()
+            self._connect(factory, t, peer_addr)
 
 
 @implementer(IListeningPort)
 @attrs
-class SubchannelListeningPort(object):
+class SubchannelListeningPort:
     _host_addr = attrib(validator=provides(IAddress))
 
     def startListening(self):

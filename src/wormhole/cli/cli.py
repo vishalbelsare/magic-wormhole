@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import os
 import time
 start = time.time()
@@ -8,7 +6,6 @@ from sys import stderr, stdout  # noqa: E402
 from textwrap import dedent, fill  # noqa: E402
 
 import click  # noqa: E402
-import six  # noqa: E402
 from twisted.internet.defer import inlineCallbacks, maybeDeferred  # noqa: E402
 from twisted.internet.task import react  # noqa: E402
 from twisted.python.failure import Failure  # noqa: E402
@@ -16,7 +13,7 @@ from twisted.python.failure import Failure  # noqa: E402
 from . import public_relay  # noqa: E402
 from .. import __version__  # noqa: E402
 from ..errors import (KeyFormatError, NoTorError,  # noqa: E402
-                      ServerConnectionError,
+                      ServerConnectionError, ServerError,
                       TransferError, UnsendableFileError, WelcomeError,
                       WrongPasswordError)
 from ..timing import DebugTiming  # noqa: E402
@@ -24,7 +21,7 @@ from ..timing import DebugTiming  # noqa: E402
 top_import_finish = time.time()
 
 
-class Config(object):
+class Config:
     """
     Union of config options that we pass down to (sub) commands.
     """
@@ -59,7 +56,7 @@ class Config(object):
         ]
         if invalid_machines:
             raise click.UsageError(
-                "Cannot debug unknown machines: {}".format(" ".join(invalid_machines))
+                f"Cannot debug unknown machines: {' '.join(invalid_machines)}"
             )
         self._debug_state = debug_state
 
@@ -94,6 +91,7 @@ class AliasedGroup(click.Group):
     "--relay-url",
     default=public_relay.RENDEZVOUS_RELAY,
     envvar='WORMHOLE_RELAY_URL',
+    show_envvar=True,
     metavar="URL",
     help="rendezvous relay to use",
 )
@@ -101,12 +99,13 @@ class AliasedGroup(click.Group):
     "--transit-helper",
     default=public_relay.TRANSIT_RELAY,
     envvar='WORMHOLE_TRANSIT_HELPER',
+    show_envvar=True,
     metavar="tcp:HOST:PORT",
     help="transit relay to use",
 )
 @click.option(
     "--dump-timing",
-    type=type(u""),  # TODO: hide from --help output
+    type=str,  # TODO: hide from --help output
     default=None,
     metavar="FILE.json",
     help="(debug) write timing data to file",
@@ -151,16 +150,30 @@ def _dispatch_command(reactor, cfg, command):
     except (WelcomeError, UnsendableFileError, KeyFormatError) as e:
         msg = fill("ERROR: " + dedent(e.__doc__))
         print(msg, file=cfg.stderr)
-        print(six.u(""), file=cfg.stderr)
-        print(six.text_type(e), file=cfg.stderr)
+        print("", file=cfg.stderr)
+        print(str(e), file=cfg.stderr)
         raise SystemExit(1)
     except TransferError as e:
-        print(u"TransferError: %s" % six.text_type(e), file=cfg.stderr)
+        print(f"TransferError: {str(e)}", file=cfg.stderr)
         raise SystemExit(1)
     except ServerConnectionError as e:
         msg = fill("ERROR: " + dedent(e.__doc__)) + "\n"
-        msg += "(relay URL was %s)\n" % e.url
-        msg += six.text_type(e)
+        msg += f"(relay URL was {e.url})\n"
+        msg += str(e)
+        print(msg, file=cfg.stderr)
+        raise SystemExit(1)
+    except ServerError as e:
+        code = str(e) if e.args else ""
+        if code == "crowded":
+            msg = fill(
+                "ERROR: Too many peers have attempted to connect to this"
+                " mailbox. Try again with your intended peer, making sure"
+                " you get a brand-new code and that it is transcribed"
+                " correctly. If this keeps happening, it may be due to an"
+                " attack."
+            )
+        else:
+            msg = f"ERROR: server error: {code}"
         print(msg, file=cfg.stderr)
         raise SystemExit(1)
     except Exception as e:
@@ -168,7 +181,7 @@ def _dispatch_command(reactor, cfg, command):
         # traceback.print_exc() just prints a TB to the "yield"
         # line above ...
         Failure().printTraceback(file=cfg.stderr)
-        print(u"ERROR:", six.text_type(e), file=cfg.stderr)
+        print("ERROR:", str(e), file=cfg.stderr)
         raise SystemExit(1)
 
     cfg.timing.add("exit")
@@ -187,7 +200,7 @@ CommonArgs = _compose(
     click.option(
         "-c",
         "--code-length",
-        default=2,
+        default=None,
         metavar="NUMWORDS",
         help="length of code (in bytes/words)",
     ),
@@ -273,10 +286,19 @@ def help(context, **kwargs):
         "any of: B,N,M,S,O,K,SK,R,RC,L,C,T"
     )
 )
-@click.argument("what", required=False, type=click.Path(path_type=type(u"")))
+@click.option(
+    "--qr/--no-qr",
+    default=True,
+    help="Generate and show ASCII-based QR code.",
+    envvar="WORMHOLE_QR",
+    show_envvar=True,
+)
+@click.argument("what", required=False, type=click.Path(path_type=str))
 @click.pass_obj
 def send(cfg, **kwargs):
     """Send a text message, file, or directory"""
+    kwargs["code_length"] = 2 if kwargs["code_length"] is None else int(kwargs["code_length"])
+
     for name, value in kwargs.items():
         setattr(cfg, name, value)
     with cfg.timing.add("import", which="cmd_send"):
@@ -305,6 +327,8 @@ def go(f, cfg):
 @click.option(
     "--accept-file",
     is_flag=True,
+    envvar="WORMHOLE_ACCEPT_FILE",
+    show_envvar=True,
     help="accept file transfer without asking for confirmation",
 )
 @click.option(
@@ -312,7 +336,15 @@ def go(f, cfg):
     "-o",
     metavar="FILENAME|DIRNAME",
     help=("The file or directory to create, overriding the name suggested"
-          " by the sender."),
+          " by the sender. If the directory exists already, the incoming transfer"
+          " will be put inside the specified directory."
+    ),
+)
+@click.option(
+    "--allocate",
+    "-a",
+    is_flag=True,
+    help="Allocate a fresh code (do not prompt for one)",
 )
 # --debug-state might be better at the top-level but Click can't parse
 # an option like "--debug-state <optional-value>" if there's a subcommand name next
@@ -341,6 +373,14 @@ def receive(cfg, code, **kwargs):
     """
     Receive a text message, file, or directory (from 'wormhole send')
     """
+    if code:
+        if kwargs["allocate"]:
+            raise click.UsageError("Cannot specify a code when using --allocate")
+    if kwargs["code_length"] and not kwargs["allocate"]:
+        raise click.UsageError("Must use --allocate with --code-length")
+
+    kwargs["code_length"] = 2 if kwargs["code_length"] is None else int(kwargs["code_length"])
+
     for name, value in kwargs.items():
         setattr(cfg, name, value)
     with cfg.timing.add("import", which="cmd_receive"):
@@ -425,10 +465,10 @@ def ssh_accept(cfg, code, key_file, yes, **kwargs):
         setattr(cfg, name, value)
     from . import cmd_ssh
     kind, keyid, pubkey = cmd_ssh.find_public_key(key_file)
-    print("Sending public key type='{}' keyid='{}'".format(kind, keyid))
+    print(f"Sending public key type='{kind}' keyid='{keyid}'")
     if yes is not True:
         click.confirm(
-            "Really send public key '{}' ?".format(keyid), abort=True)
+            f"Really send public key '{keyid}' ?", abort=True)
     cfg.public_key = (kind, keyid, pubkey)
     cfg.code = code
 

@@ -1,5 +1,3 @@
-from __future__ import print_function, unicode_literals
-
 import os
 from binascii import unhexlify
 
@@ -8,7 +6,7 @@ from zope.interface import implementer
 from ._interfaces import IWordlist
 
 # The PGP Word List, which maps bytes to phonetically-distinct words. There
-# are two lists, even and odd, and encodings should alternate between then to
+# are two lists, even and odd, and encodings should alternate between them to
 # detect dropped words. https://en.wikipedia.org/wiki/PGP_Words
 
 # Thanks to Warren Guy for transcribing them:
@@ -274,11 +272,11 @@ raw_words = {
     'FF': ['Zulu', 'Yucatan']
 }
 
-byte_to_even_word = dict([(unhexlify(k.encode("ascii")), both_words[0])
-                          for k, both_words in raw_words.items()])
+byte_to_even_word = {unhexlify(k.encode("ascii")): both_words[0]
+                          for k, both_words in raw_words.items()}
 
-byte_to_odd_word = dict([(unhexlify(k.encode("ascii")), both_words[1])
-                         for k, both_words in raw_words.items()])
+byte_to_odd_word = {unhexlify(k.encode("ascii")): both_words[1]
+                         for k, both_words in raw_words.items()}
 
 even_words_lowercase, odd_words_lowercase = set(), set()
 
@@ -289,7 +287,7 @@ for k, both_words in raw_words.items():
 
 
 @implementer(IWordlist)
-class PGPWordList(object):
+class PGPWordList:
     def get_completions(self, prefix, num_words=2):
         # start with the odd words
         count = prefix.count("-")

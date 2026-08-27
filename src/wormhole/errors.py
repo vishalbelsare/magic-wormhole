@@ -1,6 +1,3 @@
-from __future__ import unicode_literals
-
-
 class WormholeError(Exception):
     """Parent class for all wormhole-related errors"""
 
@@ -46,12 +43,14 @@ class LonelyError(WormholeError):
     """wormhole.close() was called before the peer connection could be
     established"""
 
+class CrowdedError(WormholeError):
+    """We received messages from multiple peers, there can be only one."""
 
 class WrongPasswordError(WormholeError):
     """
     Key confirmation failed. Either you or your correspondent typed the code
     wrong, or a would-be man-in-the-middle attacker guessed incorrectly. Try
-    sending the file again. 
+    sending the file again.
     """
     # or the data blob was corrupted, and that's why decrypt failed
     pass

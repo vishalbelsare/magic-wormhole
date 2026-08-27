@@ -1,8 +1,6 @@
-from __future__ import print_function, unicode_literals
 from collections import namedtuple
-import six
 from attr import attrs, attrib
-from attr.validators import instance_of, provides
+from attr.validators import instance_of
 from automat import MethodicalMachine
 from zope.interface import Interface, implementer
 from twisted.python import log
@@ -10,9 +8,10 @@ from twisted.internet.protocol import Protocol
 from twisted.internet.interfaces import ITransport
 from .._interfaces import IDilationConnector
 from ..observer import OneShotObserver
+from ..util import provides
 from .encode import to_be4, from_be4
 from .roles import LEADER, FOLLOWER
-from ._noise import NoiseInvalidMessage, NoiseHandshakeError
+from ._noise import NoiseInvalidMessage, NoiseHandshakeError, NOISE_MAX_PAYLOAD, NOISE_MAX_CIPHERTEXT
 
 # InboundFraming is given data and returns Frames (Noise wire-side
 # bytestrings). It handles the relay handshake and the prologue. The Frames it
@@ -49,8 +48,8 @@ class IRecord(Interface):
     pass
 
 
-def first(l):
-    return l[0]
+def first(seq):
+    return seq[0]
 
 
 class Disconnect(Exception):
@@ -64,7 +63,7 @@ class Disconnect(Exception):
 #    * a non-relay will probably send junk
 #    * wait for "ok\n", hang up if we get anything different
 # (all subsequent steps are for both inbound and outbound connections)
-# 2: send PROLOGUE_LEADER/FOLLOWER: "Magic-Wormhole Dilation Handshale v1 (l/f)\n\n"
+# 2: send PROLOGUE_LEADER/FOLLOWER: "Magic-Wormhole Dilation Handshake v1 (l/f)\n\n"
 # 3: wait for the opposite PROLOGUE string, else hang up
 # (everything past this point is a Frame, with be4 length prefix. Frames are
 #  either noise handshake or an encrypted message)
@@ -85,7 +84,7 @@ Frame = namedtuple("Frame", ["frame"])
 
 @attrs
 @implementer(IFramer)
-class _Framer(object):
+class _Framer:
     _transport = attrib(validator=provides(ITransport))
     _outbound_prologue = attrib(validator=instance_of(bytes))
     _inbound_prologue = attrib(validator=instance_of(bytes))
@@ -203,7 +202,7 @@ class _Framer(object):
             # Don't complain until we see the expected length, or a newline,
             # so we can capture the weird input in the log for debugging.
             if (b"\n" in self._buffer or lb >= le):
-                log.msg("bad {}: {}".format(name, self._buffer[:le]))
+                log.msg(f"bad {name}: {self._buffer[:le]}")
                 raise Disconnect()
             return False  # wait a bit longer
         # good so far, just waiting for the rest
@@ -252,7 +251,7 @@ Handshake = namedtuple("Handshake", [])
 KCM = namedtuple("KCM", [])
 Ping = namedtuple("Ping", ["ping_id"])  # ping_id is arbitrary 4-byte value
 Pong = namedtuple("Pong", ["ping_id"])
-Open = namedtuple("Open", ["seqnum", "scid"])  # seqnum is integer
+Open = namedtuple("Open", ["seqnum", "scid", "subprotocol"])  # seqnum is integer, subprotocol is str
 Data = namedtuple("Data", ["seqnum", "scid", "data"])
 Close = namedtuple("Close", ["seqnum", "scid"])  # scid is integer
 Ack = namedtuple("Ack", ["resp_seqnum"])  # resp_seqnum is integer
@@ -281,7 +280,8 @@ def parse_record(plaintext):
     if msgtype == T_OPEN:
         scid = from_be4(plaintext[1:5])
         seqnum = from_be4(plaintext[5:9])
-        return Open(seqnum, scid)
+        subprotocol = str(plaintext[9:], "utf8")
+        return Open(seqnum, scid, subprotocol)
     if msgtype == T_DATA:
         scid = from_be4(plaintext[1:5])
         seqnum = from_be4(plaintext[5:9])
@@ -294,32 +294,33 @@ def parse_record(plaintext):
     if msgtype == T_ACK:
         resp_seqnum = from_be4(plaintext[1:5])
         return Ack(resp_seqnum)
-    log.err("received unknown message type: {}".format(plaintext))
+    log.err(f"received unknown message type: {plaintext}")
     raise ValueError()
 
 
 def encode_record(r):
     if isinstance(r, KCM):
-        return b"\x00"
+        return T_KCM
     if isinstance(r, Ping):
-        return b"\x01" + r.ping_id
+        return T_PING + r.ping_id
     if isinstance(r, Pong):
-        return b"\x02" + r.ping_id
+        return T_PONG + r.ping_id
     if isinstance(r, Open):
-        assert isinstance(r.scid, six.integer_types)
-        assert isinstance(r.seqnum, six.integer_types)
-        return b"\x03" + to_be4(r.scid) + to_be4(r.seqnum)
+        assert isinstance(r.scid, int)
+        assert isinstance(r.seqnum, int)
+        assert isinstance(r.subprotocol, str)
+        return T_OPEN + to_be4(r.scid) + to_be4(r.seqnum) + r.subprotocol.encode("utf8")
     if isinstance(r, Data):
-        assert isinstance(r.scid, six.integer_types)
-        assert isinstance(r.seqnum, six.integer_types)
-        return b"\x04" + to_be4(r.scid) + to_be4(r.seqnum) + r.data
+        assert isinstance(r.scid, int)
+        assert isinstance(r.seqnum, int)
+        return T_DATA + to_be4(r.scid) + to_be4(r.seqnum) + r.data
     if isinstance(r, Close):
-        assert isinstance(r.scid, six.integer_types)
-        assert isinstance(r.seqnum, six.integer_types)
-        return b"\x05" + to_be4(r.scid) + to_be4(r.seqnum)
+        assert isinstance(r.scid, int)
+        assert isinstance(r.seqnum, int)
+        return T_CLOSE + to_be4(r.scid) + to_be4(r.seqnum)
     if isinstance(r, Ack):
-        assert isinstance(r.resp_seqnum, six.integer_types)
-        return b"\x06" + to_be4(r.resp_seqnum)
+        assert isinstance(r.resp_seqnum, int)
+        return T_ACK + to_be4(r.resp_seqnum)
     raise TypeError(r)
 
 
@@ -327,12 +328,14 @@ def _is_role(_record, _attr, value):
     if value not in [LEADER, FOLLOWER]:
         raise ValueError("role must be LEADER or FOLLOWER")
 
+
 @attrs
 @implementer(IRecord)
-class _Record(object):
+class _Record:
     _framer = attrib(validator=provides(IFramer))
     _noise = attrib()
-    _role = attrib(default="unspecified", validator=_is_role) # for debugging
+
+    _role = attrib(default="unspecified", validator=_is_role)  # for debugging
 
     n = MethodicalMachine()
     # TODO: set_trace
@@ -416,8 +419,20 @@ class _Record(object):
 
     @n.output()
     def decrypt_message(self, frame):
+        # opposite of the encoding: if we have _more_ than what a
+        # single Noise packet can hold, we have to build up the real
+        # plaintext incrementally.
+        size = len(frame)
         try:
-            message = self._noise.decrypt(frame)
+            if size <= NOISE_MAX_CIPHERTEXT:
+                message = self._noise.decrypt(frame)
+            else:
+                start = 0
+                message = b""
+                while start < size:
+                    ciphertext = frame[start:start + NOISE_MAX_CIPHERTEXT]
+                    message += self._noise.decrypt(ciphertext)
+                    start += NOISE_MAX_CIPHERTEXT
         except NoiseInvalidMessage as e:
             # if this happens during tests, flunk the test
             log.err(e, "bad inbound noise frame")
@@ -455,12 +470,24 @@ class _Record(object):
 
     def send_record(self, r):
         message = encode_record(r)
-        frame = self._noise.encrypt(message)
+        if len(message) <= NOISE_MAX_PAYLOAD:
+            frame = self._noise.encrypt(message)
+        else:
+            # we want to put all the encrypted bytes into one "frame",
+            # but there are more bytes than we can fit in a Noise
+            # message .. so we chop them up
+            start = 0
+            frame = b""
+            while start < len(message):
+                this_msg = message[start:start + NOISE_MAX_PAYLOAD]
+                cip = self._noise.encrypt(this_msg)
+                frame += cip
+                start += NOISE_MAX_PAYLOAD
         self._framer.send_frame(frame)
 
 
 @attrs(eq=False)
-class DilatedConnectionProtocol(Protocol, object):
+class DilatedConnectionProtocol(Protocol):
     """I manage an L2 connection.
 
     When a new L2 connection is needed (as determined by the Leader),
@@ -541,6 +568,11 @@ class DilatedConnectionProtocol(Protocol, object):
                                              manager.connector_connection_lost())
 
     @m.output()
+    def send_status_have_peer(self, manager):
+        assert self._manager is not None, "_manager must be set by now"
+        self._manager.have_peer(self)
+
+    @m.output()
     def can_send_records(self, manager):
         self._can_send_records = True
 
@@ -557,7 +589,7 @@ class DilatedConnectionProtocol(Protocol, object):
     unselected.upon(got_kcm, outputs=[add_candidate], enter=selecting)
     selecting.upon(got_record, outputs=[queue_inbound_record], enter=selecting)
     selecting.upon(select,
-                   outputs=[set_manager, can_send_records, process_inbound_queue],
+                   outputs=[set_manager, send_status_have_peer, can_send_records, process_inbound_queue],
                    enter=selected)
     selected.upon(got_record, outputs=[deliver_record], enter=selected)
 
@@ -595,7 +627,8 @@ class DilatedConnectionProtocol(Protocol, object):
             else:
                 self._record.set_role_follower()
             self._record.connectionMade()
-        except:
+
+        except:  # noqa
             log.err()
             raise
 

@@ -1,8 +1,7 @@
-from __future__ import print_function, unicode_literals
 from collections import defaultdict
 from binascii import hexlify
 from attr import attrs, attrib
-from attr.validators import instance_of, provides, optional
+from attr.validators import instance_of, optional
 from automat import MethodicalMachine
 from zope.interface import implementer
 from twisted.internet.task import deferLater
@@ -10,24 +9,25 @@ from twisted.internet.defer import DeferredList, CancelledError
 from twisted.internet.endpoints import serverFromString
 from twisted.internet.protocol import ClientFactory, ServerFactory
 from twisted.internet.address import HostnameAddress, IPv4Address, IPv6Address
-from twisted.internet.error import ConnectingCancelledError, ConnectionRefusedError, DNSLookupError
+from twisted.internet.error import ConnectingCancelledError, ConnectionRefusedError, DNSLookupError, ConnectError
 from twisted.python import log
 from .. import ipaddrs  # TODO: move into _dilation/
 from .._interfaces import IDilationConnector, IDilationManager
 from ..timing import DebugTiming
 from ..observer import EmptyableSet
-from ..util import HKDF, to_unicode
+from ..util import HKDF, to_unicode, provides
 from .connection import DilatedConnectionProtocol, KCM
 from .roles import LEADER
 
 from .._hints import (DirectTCPV1Hint, TorTCPV1Hint, RelayV1Hint,
                       parse_hint_argv, describe_hint_obj, endpoint_from_hint_obj,
                       encode_hint)
+from .._status import DilationHint
 from ._noise import NoiseConnection
 
 
 def build_sided_relay_handshake(key, side):
-    assert isinstance(side, type(u""))
+    assert isinstance(side, str)
     # magic-wormhole-transit-relay expects a specific layout for the
     # handshake message: "please relay {64} for side {16}\n"
     assert len(side) == 8 * 2, side
@@ -40,12 +40,14 @@ PROLOGUE_LEADER = b"Magic-Wormhole Dilation Handshake v1 Leader\n\n"
 PROLOGUE_FOLLOWER = b"Magic-Wormhole Dilation Handshake v1 Follower\n\n"
 NOISEPROTO = b"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
 
+
 def build_noise():
     return NoiseConnection.from_name(NOISEPROTO)
 
+
 @attrs(eq=False)
 @implementer(IDilationConnector)
-class Connector(object):
+class Connector:
     """I manage a single generation of connection.
 
     The Manager creates one of me at a time, whenever it wants a connection
@@ -73,15 +75,15 @@ class Connector(object):
     or not.
     """
 
-    _dilation_key = attrib(validator=instance_of(type(b"")))
-    _transit_relay_location = attrib(validator=optional(instance_of(type(u""))))
+    _dilation_key = attrib(validator=instance_of(bytes))
+    _transit_relay_location = attrib(validator=optional(instance_of(str)))
     _manager = attrib(validator=provides(IDilationManager))
     _reactor = attrib()
     _eventual_queue = attrib()
     _no_listen = attrib(validator=instance_of(bool))
     _tor = attrib()
     _timing = attrib()
-    _side = attrib(validator=instance_of(type(u"")))
+    _side = attrib(validator=instance_of(str))
     # was self._side = bytes_to_hexstr(os.urandom(8)) # unicode
     _role = attrib()
 
@@ -148,12 +150,6 @@ class Connector(object):
 
     # TODO: unify the tense of these method-name verbs
 
-    # add_relay() and got_hints() are called by the Manager as it receives
-    # messages from our peer. stop() is called when the Manager shuts down
-    @m.input()
-    def add_relay(self, hint_objs):
-        pass
-
     @m.input()
     def got_hints(self, hint_objs):
         pass
@@ -177,7 +173,6 @@ class Connector(object):
     @m.input()
     def accept(self, c):
         pass
-
 
     @m.output()
     def use_hints(self, hint_objs):
@@ -229,7 +224,7 @@ class Connector(object):
         self.break_cycles()
 
     def stop_listeners(self):
-        d = DeferredList([l.stopListening() for l in self._listeners])
+        d = DeferredList([sub.stopListening() for sub in self._listeners])
         self._listeners.clear()
         return d  # synchronization for tests
 
@@ -250,8 +245,6 @@ class Connector(object):
         self._winning_connection = None
 
     connecting.upon(listener_ready, enter=connecting, outputs=[publish_hints])
-    connecting.upon(add_relay, enter=connecting, outputs=[use_hints,
-                                                          publish_hints])
     connecting.upon(got_hints, enter=connecting, outputs=[use_hints])
     connecting.upon(add_candidate, enter=connecting, outputs=[consider])
     connecting.upon(accept, enter=connected, outputs=[
@@ -260,7 +253,6 @@ class Connector(object):
 
     # once connected, we ignore everything except stop
     connected.upon(listener_ready, enter=connected, outputs=[])
-    connected.upon(add_relay, enter=connected, outputs=[])
     connected.upon(got_hints, enter=connected, outputs=[])
     # TODO: tell them to disconnect? will they hang out forever? I *think*
     # they'll drop this once they get a KCM on the winning connection.
@@ -311,9 +303,14 @@ class Connector(object):
         desc = describe_hint_obj(h, is_relay, self._tor)
         d = deferLater(self._reactor, delay,
                        self._connect, ep, desc, is_relay)
+
+        # "ConnectError" is a base-class in Twisted, but can be raised
+        # directly when the "errno to class" mapping doesn't have an
+        # error-number mapped
         d.addErrback(lambda f: f.trap(ConnectingCancelledError,
                                       ConnectionRefusedError,
                                       CancelledError,
+                                      ConnectError,
                                       ))
         # TODO: HostnameEndpoint.connect catches CancelledError and replaces
         # it with DNSLookupError. Remove this workaround when
@@ -326,6 +323,7 @@ class Connector(object):
         # first, pull out all the relays, we'll connect to them later
         relays = []
         direct = defaultdict(list)
+        hint_status = []
         for h in hints:
             if isinstance(h, RelayV1Hint):
                 relays.append(h)
@@ -338,6 +336,7 @@ class Connector(object):
             for h in direct[p]:
                 if isinstance(h, TorTCPV1Hint) and not self._tor:
                     continue
+                hint_status.append(DilationHint(f"{h.hostname}:{h.port}", True))
                 self._schedule_connection(delay, h, is_relay=False)
                 made_direct = True
                 # Make all direct connections immediately. Later, we'll change
@@ -369,6 +368,9 @@ class Connector(object):
         for r in relays:
             for h in r.hints:
                 self._schedule_connection(delay, h, is_relay=True)
+                hint_status.append(DilationHint(f"{h.hostname}:{h.port}", False))
+
+        self._manager._hint_status(hint_status)
         # TODO:
         # if not contenders:
         #    raise TransitError("No contenders for connection")
@@ -409,13 +411,13 @@ class Connector(object):
 
 
 @attrs(repr=False)
-class OutboundConnectionFactory(ClientFactory, object):
+class OutboundConnectionFactory(ClientFactory):
     _connector = attrib(validator=provides(IDilationConnector))
     _relay_handshake = attrib(validator=optional(instance_of(bytes)))
     _description = attrib()
 
     def __repr__(self):
-        return "OutboundConnectionFactory(%s %s)" % (self._connector._role, self._description)
+        return f"OutboundConnectionFactory({self._connector._role} {self._description})"
 
     def buildProtocol(self, addr):
         p = self._connector.build_protocol(addr, self._description)
@@ -424,6 +426,7 @@ class OutboundConnectionFactory(ClientFactory, object):
             p.use_relay(self._relay_handshake)
         return p
 
+
 def describe_inbound(addr):
     if isinstance(addr, HostnameAddress):
         return "<-tcp:%s:%d" % (addr.hostname, addr.port)
@@ -431,14 +434,15 @@ def describe_inbound(addr):
         return "<-tcp:%s:%d" % (addr.host, addr.port)
     elif isinstance(addr, IPv6Address):
         return "<-tcp:[%s]:%d" % (addr.host, addr.port)
-    return "<-%r" % addr
+    return f"<-{addr!r}"
+
 
 @attrs(repr=False)
-class InboundConnectionFactory(ServerFactory, object):
+class InboundConnectionFactory(ServerFactory):
     _connector = attrib(validator=provides(IDilationConnector))
 
     def __repr__(self):
-        return "InboundConnectionFactory(%s)" % (self._connector._role)
+        return f"InboundConnectionFactory({self._connector._role})"
 
     def buildProtocol(self, addr):
         description = describe_inbound(addr)

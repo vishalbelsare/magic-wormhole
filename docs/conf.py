@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-#
+
 # Magic-Wormhole documentation build configuration file, created by
 # sphinx-quickstart on Sun Nov 12 10:24:09 2017.
 #
@@ -20,12 +19,6 @@
 # import sys
 # sys.path.insert(0, os.path.abspath('.'))
 
-from recommonmark.parser import CommonMarkParser
-
-source_parsers = {
-    ".md": CommonMarkParser,
-}
-
 # -- General configuration ------------------------------------------------
 
 # If your documentation needs a minimal Sphinx version, state it here.
@@ -35,7 +28,10 @@ source_parsers = {
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = []
+extensions = ['sphinxcontrib.seqdiag']
+
+seqdiag_antialias = True
+seqdiag_html_image_format = "SVG"
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -43,16 +39,15 @@ templates_path = ['_templates']
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
 #
-source_suffix = ['.rst', '.md']
-#source_suffix = '.md'
+source_suffix = ['.rst']
 
 # The master toctree document.
 master_doc = 'index'
 
 # General information about the project.
-project = u'Magic-Wormhole'
-copyright = u'2017, Brian Warner'
-author = u'Brian Warner'
+project = 'Magic-Wormhole'
+copyright = '2017, Brian Warner'
+author = 'Brian Warner'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -80,7 +75,7 @@ version, release = _get_versions()
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -105,7 +100,14 @@ html_theme = 'alabaster'
 # further.  For a list of options available for each theme, see the
 # documentation.
 #
-# html_theme_options = {}
+html_theme_options = {
+    "logo": "wormhole.png",
+    "logo_name": True,
+    "logo_text_align": "center",
+    "description": "Get things from one computer to another, safely.",
+    "github_user": "magic-wormhole",
+    "github_repo": "magic-wormhole",
+}
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -119,8 +121,10 @@ html_static_path = ['_static']
 # refs: http://alabaster.readthedocs.io/en/latest/installation.html#sidebars
 html_sidebars = {
     '**': [
+        'about.html',
         'relations.html',  # needs 'show_related': True theme option to display
         'searchbox.html',
+        'navigation.html',
     ]
 }
 
@@ -155,8 +159,8 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (master_doc, 'Magic-Wormhole.tex', u'Magic-Wormhole Documentation',
-     u'Brian Warner', 'manual'),
+    (master_doc, 'Magic-Wormhole.tex', 'Magic-Wormhole Documentation',
+     'Brian Warner', 'manual'),
 ]
 
 
@@ -165,7 +169,7 @@ latex_documents = [
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 man_pages = [
-    (master_doc, 'magic-wormhole', u'Magic-Wormhole Documentation',
+    (master_doc, 'magic-wormhole', 'Magic-Wormhole Documentation',
      [author], 1)
 ]
 
@@ -176,10 +180,12 @@ man_pages = [
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-    (master_doc, 'Magic-Wormhole', u'Magic-Wormhole Documentation',
+    (master_doc, 'Magic-Wormhole', 'Magic-Wormhole Documentation',
      author, 'Magic-Wormhole', 'One line description of project.',
      'Miscellaneous'),
 ]
 
+# -- Options for linkcheck ------------------------------------------------
 
-
+# Skip checking validity of #anchors in links.
+linkcheck_anchors = False
